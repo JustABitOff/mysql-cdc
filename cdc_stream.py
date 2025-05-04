@@ -1,57 +1,35 @@
-import json
-from os import getenv
+from logging import getLogger
 
-import boto3
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.row_event import (
     DeleteRowsEvent,
     UpdateRowsEvent,
     WriteRowsEvent,
 )
+import redis
 from celery import Celery
 
-app = Celery('tasks', broker='pyamqp://guest@localhost//')
+logger = getLogger('stream')
+
+redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+
+app = Celery('tasks', broker='pyamqp://guest:guest@127.0.0.1:5672//')
 
 
-@app.task(name='put_record_to_kinesis')
-def put_record_to_kinesis(
+@app.task(name='put_record')
+def put_record(
     event, 
-    kinesis_partition_key,
     server_id,
     log_file,
     log_pos
 ):
-    kinesis = boto3.client(
-        'kinesis',
-        region_name='us-east-2',
-        aws_access_key_id=getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=getenv('AWS_SECRET_ACCESS_KEY')
-    )
-    dynamo_table = boto3.resource(
-        'dynamodb',
-        region_name='us-east-2',
-        aws_access_key_id=getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=getenv('AWS_SECRET_ACCESS_KEY')
-    ).Table('cdc_stream_state')
+    logger.info(f'>>> event inside the worker: {event}')
 
-    kinesis_output = kinesis.put_record(
-        StreamName='mysql_cdc_stream',
-        Data=json.dumps(event),
-        PartitionKey=kinesis_partition_key
-    )
-    print('>>> kinesis output: ', kinesis_output)
-    
-    dynamo_table.update_item(
-        Key={
-            'server_id': server_id
-        },
-        UpdateExpression="set log_file=:f, log_file_sequence=:s, log_pos=:p",
-        ExpressionAttributeValues={
-            ":f": log_file,
-            ":s": int(log_file.split('.')[-1]),
-            ":p": log_pos
-        },
-    )
+    redis_key = f"cdc:{server_id}"
+    redis_client.hmset(redis_key, {
+        'log_file': log_file,
+        'log_pos': log_pos
+    })
 
 
 def main():
@@ -61,18 +39,16 @@ def main():
       'user': 'root',
       'passwd': 'password'
     }
-    dynamo_table = boto3.resource(
-        'dynamodb',
-        region_name='us-east-2',
-        aws_access_key_id=getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=getenv('AWS_SECRET_ACCESS_KEY')
-    ).Table('cdc_stream_state')
-    server_id = 1012598212
-    log_state = dynamo_table.get_item(Key={'server_id': server_id}, ConsistentRead=True).get('Item')
-    log_file = log_state.get('log_file') if log_state else None
-    log_pos = int(log_state.get('log_pos')) if log_state else None
 
-    print('>>> listener start streaming')
+    server_id = 1
+    redis_key = f"cdc:{server_id}"
+    logger.info(f">>> Starting service")
+    state = redis_client.hgetall(redis_key)
+    log_file = state.get('log_file', None)
+    log_pos = int(state['log_pos']) if 'log_pos' in state else None
+
+    logger.info(f">>> Starting binlog stream with log_file={log_file}, log_pos={log_pos}")
+
     stream = BinLogStreamReader(
         connection_settings=MYSQL_SETTINGS,
         server_id=server_id,
@@ -82,43 +58,36 @@ def main():
         log_file=log_file,
         log_pos=log_pos,
     )
+
     for binlogevent in stream:
-        print(f'>>> events for log file {stream.log_file} at position {binlogevent.packet.log_pos}:')
+
+        logger.info(f'>>> events for log file {stream.log_file} at position {binlogevent.packet.log_pos}:')
+        
         for row in binlogevent.rows:
             if isinstance(binlogevent, WriteRowsEvent):
-                event = {
-                    'event_type': 'insert',
-                    'timestamp': binlogevent.timestamp,
-                    'schema': binlogevent.schema,
-                    'table': binlogevent.table,
-                    'log_position': binlogevent.packet.log_pos,
-                    'row': row.get('values', None),
-                }
+                event_type = 'insert'
+                row_data = row.get('values', None)
             elif isinstance(binlogevent, UpdateRowsEvent):
-                event = {
-                    'event_type': 'update',
-                    'timestamp': binlogevent.timestamp,
-                    'schema': binlogevent.schema,
-                    'table': binlogevent.table,
-                    'log_position': binlogevent.packet.log_pos,
-                    'row': row.get('after_values', None),
-                }
+                event_type = 'update'
+                row_data = row.get('after_values', None)
             elif isinstance(binlogevent, DeleteRowsEvent):
-                event = {
-                    'event_type': 'delete',
-                    'timestamp': binlogevent.timestamp,
-                    'schema': binlogevent.schema,
-                    'table': binlogevent.table,
-                    'log_position': binlogevent.packet.log_pos,
-                    'row': row.get('values', None),
-                }
+                event_type = 'delete'
+                row_data = row.get('values', None)
             else:
-                pass
+                continue
 
-            print('>>> event:', event)
-            put_record_to_kinesis.delay(
+            event = {
+                'event_type': event_type,
+                'timestamp': binlogevent.timestamp,
+                'schema': binlogevent.schema,
+                'table': binlogevent.table,
+                'log_position': binlogevent.packet.log_pos,
+                'row': row_data,
+            }
+            print(event)
+
+            put_record.delay(
                 event,
-                f'{binlogevent.schema}.{binlogevent.table}',
                 server_id,
                 stream.log_file,
                 binlogevent.packet.log_pos

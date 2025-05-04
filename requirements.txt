@@ -2,3 +2,4 @@ mysql-replication==1.0.5
 boto3==1.34.9
 cryptography
 celery
+redis
