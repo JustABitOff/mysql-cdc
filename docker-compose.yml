@@ -14,32 +14,23 @@ services:
     volumes:
       - my-db:/var/lib/mysql
       - ./my.cnf:/etc/mysql/conf.d/my.cnf
-
-  rabbitmq_server:
-    image: rabbitmq:3-management
-    ports:
-      - 5672:5672
-      - 15672:15672
-
-  redis:
-    image: redis:alpine
-    restart: always
-    ports:
-      - '6379:6379'
-    volumes:
-      - redis-data:/data
-
-  worker:
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      
+  cdc:
     build:
       context: .
-      dockerfile: worker.Dockerfile
-    network_mode: host
-    environment:
-      rabbitmq_uri: amqp://guest:guest127.0.0.1:5672
-    depends_on: 
-      - rabbitmq_server
-      - redis
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./.pyiceberg.yaml:/app/.pyiceberg.yaml
       
 volumes:
   my-db:
-  redis-data:
