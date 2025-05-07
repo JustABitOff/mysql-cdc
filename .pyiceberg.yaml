@@ -1,0 +1,14 @@
+# PyIceberg Configuration
+
+catalog:
+  # Default catalog configuration
+  default:
+    type: glue
+    # Glue catalog configuration
+    glue.region: us-east-2
+    # AWS credentials will be loaded from environment variables automatically
+    # or from the AWS credentials file if using AWS_PROFILE
+    
+    # S3 FileIO configuration
+    # AWS credentials will be loaded from environment variables automatically
+    # or from the AWS credentials file if using AWS_PROFILE
